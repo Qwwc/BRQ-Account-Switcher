@@ -1,0 +1,676 @@
+package cli
+
+import (
+	"fmt"
+	"log/slog"
+	"net/url"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"unicode"
+)
+
+// Kind describes the primary CLI intent after parsing.
+type Kind int
+
+const (
+	KindNone Kind = iota
+	KindSwapSteam
+	KindSwapBasic
+	KindLogout
+	KindHelp
+	KindOpenPage
+	KindListPlatforms
+	KindListAccounts
+	KindCleanLegacyInstall
+)
+
+// Parsed is the normalized CLI result.
+type Parsed struct {
+	Kind                  Kind
+	Verbose               bool
+	Help                  bool
+	SteamID64             string
+	PersonaState          int      // steam swap; -1 means default / unchanged
+	PlatformKey           string   // canonical platform name from Platforms.json
+	UniqueID              string   // basic platforms
+	LogoutPlatform        string   // optional filter for logout
+	LogoutAccount         string   // optional id for logout (reserved)
+	OpenPage              string   // platform name for GUI route
+	PassthroughLaunchArgs []string // forwarded to the target platform exe (not TcNo flags)
+	RunShortcutFile       string   // basename of .lnk/.url; used with swap to launch from cache / fallback
+	RunAppID              string   // numeric Steam app id; Steam + +s only, launches steam://rungameid/
+	StartInTray           bool     // -tray: start GUI with main window hidden
+	OutputJSON            bool     // --json: machine-readable stdout for list commands
+	ListAccountsPlatform  string   // KindListAccounts: empty = all platforms; else canonical name
+	LogLevelSet           bool     // true if --log-level was passed
+	LogLevel              slog.Level
+	GoroutineLeakProfile  string // optional diagnostic report written after the GUI exits
+	UserDataMoveFrom      string // --userdata-move-from= old path after relocation restart
+	UserDataMoveTo        string // --userdata-move-to= new path after relocation restart
+	StartupToast          string // --toast= i18n key emitted when GUI window is ready
+	// AllowSteamGuardCapture drops the screen-capture protection on Steam Guard
+	// windows for this run, so they can be recorded or screenshotted. Off unless
+	// asked for: that protection is what keeps codes and trades out of screen
+	// shares and remote-desktop sessions.
+	AllowSteamGuardCapture bool // --allow-steamguard-capture
+
+	// GameModeSwitch marks this process as the helper a Game Mode switch handed
+	// its swap to, so the swap runs here instead of being handed off again.
+	// Internal: set by the app, not by a user, so it stays out of HelpText.
+	GameModeSwitch bool // --gamescope-switch
+}
+
+const steamPlatformName = "Steam"
+
+// EffectiveSlogLevel returns the slog level for app and Wails logging.
+func (p Parsed) EffectiveSlogLevel() slog.Level {
+	if p.LogLevelSet {
+		return p.LogLevel
+	}
+	if p.Verbose {
+		return slog.LevelDebug
+	}
+	return slog.LevelInfo
+}
+
+// protocolPrefixes are the URL schemes BRQ answers to: its own "brq:" and the
+// upstream "tcno:" form, so links written for the original still parse.
+var protocolPrefixes = []string{"brq:", "tcno:"}
+
+func protocolPrefix(s string) string {
+	lower := strings.ToLower(s)
+	for _, p := range protocolPrefixes {
+		if strings.HasPrefix(lower, p) {
+			return p
+		}
+	}
+	return ""
+}
+
+// NormalizeProtocolArg strips the brq/tcno scheme and modern or legacy path separators.
+func NormalizeProtocolArg(s string) string {
+	s = strings.TrimSpace(s)
+	if p := protocolPrefix(s); p != "" {
+		s = strings.TrimLeft(s[len(p):], `/\`)
+	}
+	return strings.TrimSpace(s)
+}
+
+// Parse inspects argv (typically os.Args[1:]) with optional platform index from LoadPlatformIndex.
+func Parse(argv []string, idx *PlatformIndex) (Parsed, error) {
+	var p Parsed
+	p.PersonaState = -1
+
+	if len(argv) == 0 {
+		return p, nil
+	}
+
+	expanded := make([]string, 0, len(argv))
+	for _, a := range argv {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		if protocolPrefix(a) != "" {
+			a = NormalizeProtocolArg(a)
+			// Windows passes the whole protocol URL as one quoted argument.
+			// Browsers may escape the space before an appended Steam URI.
+			decoded, err := url.PathUnescape(a)
+			if err != nil {
+				return Parsed{}, fmt.Errorf("tcno protocol: %w", err)
+			}
+			a = strings.TrimSpace(decoded)
+			var gameURI string
+			if split := strings.LastIndexFunc(a, unicode.IsSpace); split >= 0 &&
+				strings.HasPrefix(strings.ToLower(a[split+1:]), "steam://rungameid/") {
+				gameURI = a[split+1:]
+				a = strings.TrimSpace(a[:split])
+			}
+			// Protocol swap tokens omit the CLI's leading '+'. Keep logout
+			// and page payloads on their existing command paths.
+			if strings.Contains(a, ":") && !strings.HasPrefix(a, "+") && !isLogoutToken(a) {
+				a = "+" + a
+			}
+			expanded = append(expanded, a)
+			if gameURI != "" {
+				expanded = append(expanded, gameURI)
+			}
+			continue
+		}
+		expanded = append(expanded, a)
+	}
+
+	for _, a := range expanded {
+		al := strings.ToLower(a)
+		switch al {
+		case "-h", "--help", "help", "/?":
+			p.Help = true
+			p.Kind = KindHelp
+			continue
+		case "-v", "--verbose", "verbose":
+			p.Verbose = true
+			continue
+		case "-tray", "--tray":
+			p.StartInTray = true
+			continue
+		case "--json", "-json":
+			p.OutputJSON = true
+			continue
+		case "--gamescope-switch", "-gamescope-switch":
+			p.GameModeSwitch = true
+			continue
+		case "--allow-steamguard-capture", "-allow-steamguard-capture":
+			p.AllowSteamGuardCapture = true
+			continue
+		// Internal: the app spawns itself elevated with this to delete the old
+		// C# files from a write-protected install folder. Undocumented in
+		// HelpText, like the --userdata-move-* restart plumbing.
+		case "--clean-legacy-install", "-clean-legacy-install":
+			if err := mergePrimary(&p, Parsed{Kind: KindCleanLegacyInstall}); err != nil {
+				return Parsed{}, err
+			}
+			continue
+		}
+
+		if strings.HasPrefix(al, "--goroutine-leak-profile=") {
+			path := strings.TrimSpace(a[len("--goroutine-leak-profile="):])
+			if !filepath.IsAbs(path) || p.GoroutineLeakProfile != "" {
+				return Parsed{}, fmt.Errorf("--goroutine-leak-profile requires one absolute output filename")
+			}
+			p.GoroutineLeakProfile = path
+			continue
+		}
+		if lvl, ok, err := parseLogLevelArg(a); err != nil {
+			return Parsed{}, err
+		} else if ok {
+			if p.LogLevelSet {
+				return Parsed{}, fmt.Errorf("duplicate --log-level")
+			}
+			p.LogLevel = lvl
+			p.LogLevelSet = true
+			continue
+		}
+
+		if parseListPlatformsFlag(a) {
+			if err := mergePrimary(&p, Parsed{Kind: KindListPlatforms}); err != nil {
+				return Parsed{}, err
+			}
+			continue
+		}
+
+		if val, ok := parseListAccountsFlag(a); ok {
+			canon := strings.TrimSpace(val)
+			if canon != "" {
+				if idx == nil {
+					return Parsed{}, fmt.Errorf("--list-accounts: platforms file not loaded")
+				}
+				c, has := resolvePlatformAlias(idx, canon)
+				if !has {
+					return Parsed{}, fmt.Errorf("--list-accounts: unknown platform %q", val)
+				}
+				canon = c
+			}
+			if err := mergePrimary(&p, Parsed{Kind: KindListAccounts, ListAccountsPlatform: canon}); err != nil {
+				return Parsed{}, err
+			}
+			continue
+		}
+
+		if isLogoutToken(a) {
+			lp, err := logoutParsed(a)
+			if err != nil {
+				return Parsed{}, err
+			}
+			if err := mergePrimary(&p, lp); err != nil {
+				return Parsed{}, err
+			}
+			continue
+		}
+
+		if strings.HasPrefix(a, "+") {
+			pp, err := parsePlusToken(a, idx)
+			if err != nil {
+				return Parsed{}, err
+			}
+			if err := mergePrimary(&p, pp); err != nil {
+				return Parsed{}, err
+			}
+			continue
+		}
+
+		// Explicit open-page (e.g. elevated restart): --page=Steam, --open-page=Steam
+		if pageVal, ok := parseOpenPageFlag(a); ok {
+			pageVal = strings.TrimSpace(pageVal)
+			if pageVal != "" {
+				canon := pageVal
+				if idx != nil {
+					if c, has := resolvePlatformAlias(idx, pageVal); has {
+						canon = c
+					}
+				}
+				if err := mergePrimary(&p, Parsed{Kind: KindOpenPage, OpenPage: canon}); err != nil {
+					return Parsed{}, err
+				}
+			}
+			continue
+		}
+
+		if val, ok := parseRunShortcutFlag(a); ok {
+			dec, err := url.QueryUnescape(val)
+			if err != nil {
+				return Parsed{}, fmt.Errorf("--run-shortcut: %w", err)
+			}
+			dec = strings.TrimSpace(dec)
+			if dec == "" {
+				return Parsed{}, fmt.Errorf("--run-shortcut: empty value")
+			}
+			if p.RunShortcutFile != "" {
+				return Parsed{}, fmt.Errorf("duplicate --run-shortcut")
+			}
+			p.RunShortcutFile = filepath.Base(dec)
+			continue
+		}
+
+		if val, ok := parseUserDataMoveFromFlag(a); ok {
+			if p.UserDataMoveFrom != "" {
+				return Parsed{}, fmt.Errorf("duplicate --userdata-move-from")
+			}
+			p.UserDataMoveFrom = val
+			continue
+		}
+
+		if val, ok := parseUserDataMoveToFlag(a); ok {
+			if p.UserDataMoveTo != "" {
+				return Parsed{}, fmt.Errorf("duplicate --userdata-move-to")
+			}
+			p.UserDataMoveTo = val
+			continue
+		}
+
+		if val, ok := parseStartupToastFlag(a); ok {
+			if p.StartupToast != "" {
+				return Parsed{}, fmt.Errorf("duplicate --toast")
+			}
+			p.StartupToast = val
+			continue
+		}
+
+		if val, ok := parseRunAppIDFlag(a); ok {
+			val = strings.TrimSpace(val)
+			if val == "" {
+				return Parsed{}, fmt.Errorf("--run-appid: empty value")
+			}
+			for _, r := range val {
+				if r < '0' || r > '9' {
+					return Parsed{}, fmt.Errorf("--run-appid: must be numeric digits only")
+				}
+			}
+			if p.RunAppID != "" {
+				return Parsed{}, fmt.Errorf("duplicate --run-appid")
+			}
+			p.RunAppID = val
+			continue
+		}
+
+		if idx != nil {
+			if canon, ok := resolvePlatformAlias(idx, a); ok {
+				pp := Parsed{Kind: KindOpenPage, OpenPage: canon}
+				if err := mergePrimary(&p, pp); err != nil {
+					return Parsed{}, err
+				}
+				continue
+			}
+		}
+		p.PassthroughLaunchArgs = append(p.PassthroughLaunchArgs, a)
+	}
+
+	if p.Help && p.Kind != KindHelp && p.Kind == KindNone {
+		p.Kind = KindHelp
+	}
+
+	if p.RunAppID != "" && p.Kind != KindSwapSteam {
+		return Parsed{}, fmt.Errorf("--run-appid requires +s:<steamId64>")
+	}
+	if p.RunShortcutFile != "" && p.RunAppID != "" {
+		return Parsed{}, fmt.Errorf("cannot combine --run-shortcut and --run-appid")
+	}
+	if p.RunShortcutFile != "" && p.Kind != KindSwapSteam && p.Kind != KindSwapBasic {
+		return Parsed{}, fmt.Errorf("--run-shortcut requires a swap token (+s: or +<platform>:)")
+	}
+
+	if p.OutputJSON && p.Kind != KindListPlatforms && p.Kind != KindListAccounts {
+		return Parsed{}, fmt.Errorf("--json requires --list-platforms or --list-accounts")
+	}
+
+	return p, nil
+}
+
+// parseOpenPageFlag returns (value, true) for --page=X, -page=X, --open-page=X (case-insensitive keys).
+func parseOpenPageFlag(a string) (string, bool) {
+	s := strings.TrimSpace(a)
+	lo := strings.ToLower(s)
+	for _, prefix := range []string{"--page=", "-page=", "--open-page=", "-open-page="} {
+		if strings.HasPrefix(lo, strings.ToLower(prefix)) {
+			return strings.TrimSpace(s[len(prefix):]), true
+		}
+	}
+	return "", false
+}
+
+func parseRunShortcutFlag(a string) (string, bool) {
+	s := strings.TrimSpace(a)
+	lo := strings.ToLower(s)
+	for _, prefix := range []string{"--run-shortcut=", "-run-shortcut="} {
+		if strings.HasPrefix(lo, strings.ToLower(prefix)) {
+			return strings.TrimSpace(s[len(prefix):]), true
+		}
+	}
+	return "", false
+}
+
+func parseUserDataMoveFromFlag(a string) (string, bool) {
+	s := strings.TrimSpace(a)
+	lo := strings.ToLower(s)
+	for _, prefix := range []string{"--userdata-move-from=", "-userdata-move-from="} {
+		if strings.HasPrefix(lo, strings.ToLower(prefix)) {
+			return strings.TrimSpace(s[len(prefix):]), true
+		}
+	}
+	return "", false
+}
+
+func parseUserDataMoveToFlag(a string) (string, bool) {
+	s := strings.TrimSpace(a)
+	lo := strings.ToLower(s)
+	for _, prefix := range []string{"--userdata-move-to=", "-userdata-move-to="} {
+		if strings.HasPrefix(lo, strings.ToLower(prefix)) {
+			return strings.TrimSpace(s[len(prefix):]), true
+		}
+	}
+	return "", false
+}
+
+func parseStartupToastFlag(a string) (string, bool) {
+	s := strings.TrimSpace(a)
+	lo := strings.ToLower(s)
+	for _, prefix := range []string{"--toast=", "-toast="} {
+		if strings.HasPrefix(lo, strings.ToLower(prefix)) {
+			return strings.TrimSpace(s[len(prefix):]), true
+		}
+	}
+	return "", false
+}
+
+func parseRunAppIDFlag(a string) (string, bool) {
+	s := strings.TrimSpace(a)
+	lo := strings.ToLower(s)
+	for _, prefix := range []string{"--run-appid=", "-run-appid=", "steam://rungameid/"} {
+		if strings.HasPrefix(lo, strings.ToLower(prefix)) {
+			return strings.TrimSpace(s[len(prefix):]), true
+		}
+	}
+	return "", false
+}
+
+func parseListPlatformsFlag(a string) bool {
+	lo := strings.ToLower(strings.TrimSpace(a))
+	return lo == "--list-platforms" || lo == "-list-platforms"
+}
+
+// parseListAccountsFlag returns (filter, true) for --list-accounts or --list-accounts=value.
+// filter is empty for all platforms; otherwise the raw token before alias resolution.
+func parseListAccountsFlag(a string) (filter string, ok bool) {
+	s := strings.TrimSpace(a)
+	lo := strings.ToLower(s)
+	if lo == "--list-accounts" || lo == "-list-accounts" {
+		return "", true
+	}
+	for _, prefix := range []string{"--list-accounts=", "-list-accounts="} {
+		if strings.HasPrefix(lo, strings.ToLower(prefix)) {
+			return strings.TrimSpace(s[len(prefix):]), true
+		}
+	}
+	return "", false
+}
+
+func isLogoutToken(a string) bool {
+	s := strings.TrimSpace(a)
+	lo := strings.ToLower(s)
+	if lo == "logout" {
+		return true
+	}
+	return strings.HasPrefix(lo, "logout:") || strings.HasPrefix(lo, "logout ")
+}
+
+func logoutParsed(a string) (Parsed, error) {
+	p := Parsed{Kind: KindLogout}
+	s := strings.TrimSpace(a)
+	lo := strings.ToLower(s)
+	if !strings.HasPrefix(lo, "logout") {
+		return Parsed{}, fmt.Errorf("not a logout token")
+	}
+	s = strings.TrimSpace(s[len("logout"):])
+	rest := s
+	if strings.HasPrefix(rest, ":") {
+		rest = rest[1:]
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return p, nil
+	}
+	parts := strings.Split(rest, ":")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	if len(parts) >= 1 && parts[0] != "" {
+		p.LogoutPlatform = parts[0]
+	}
+	if len(parts) >= 2 && parts[1] != "" {
+		p.LogoutAccount = parts[1]
+	}
+	return p, nil
+}
+
+func mergePrimary(dst *Parsed, src Parsed) error {
+	if src.Kind == KindNone {
+		return nil
+	}
+	if dst.Kind != KindNone && dst.Kind != src.Kind {
+		return fmt.Errorf("conflicting commands (already %v, got %v)", dst.Kind, src.Kind)
+	}
+	if src.Kind == KindListAccounts && dst.Kind == KindListAccounts {
+		s := strings.TrimSpace(src.ListAccountsPlatform)
+		d := strings.TrimSpace(dst.ListAccountsPlatform)
+		if d != "" && s != "" && !strings.EqualFold(d, s) {
+			return fmt.Errorf("conflicting --list-accounts filters")
+		}
+	}
+	dst.Kind = src.Kind
+	dst.SteamID64 = src.SteamID64
+	dst.PersonaState = src.PersonaState
+	dst.PlatformKey = src.PlatformKey
+	dst.UniqueID = src.UniqueID
+	dst.OpenPage = src.OpenPage
+	dst.LogoutPlatform = src.LogoutPlatform
+	dst.LogoutAccount = src.LogoutAccount
+	switch src.Kind {
+	case KindListPlatforms:
+		dst.ListAccountsPlatform = ""
+	case KindListAccounts:
+		if strings.TrimSpace(src.ListAccountsPlatform) != "" {
+			dst.ListAccountsPlatform = strings.TrimSpace(src.ListAccountsPlatform)
+		} else {
+			dst.ListAccountsPlatform = ""
+		}
+	}
+	return nil
+}
+
+func parsePlusToken(a string, idx *PlatformIndex) (Parsed, error) {
+	if !strings.HasPrefix(a, "+") {
+		return Parsed{}, fmt.Errorf("invalid token")
+	}
+	body := a[1:]
+	idxColon := strings.Index(body, ":")
+	if idxColon < 0 {
+		return Parsed{}, fmt.Errorf("expected +prefix:value in %q", a)
+	}
+	prefix := strings.ToLower(strings.TrimSpace(body[:idxColon]))
+	val := strings.TrimSpace(body[idxColon+1:])
+	if prefix == "" || val == "" {
+		return Parsed{}, fmt.Errorf("empty +prefix:value in %q", a)
+	}
+
+	if prefix == "s" {
+		return parseSteamSwap(val)
+	}
+
+	if idx == nil {
+		return Parsed{}, fmt.Errorf("unknown platform prefix %q (platforms file not loaded)", prefix)
+	}
+
+	platformName, ok := resolvePlatformAlias(idx, prefix)
+	if !ok {
+		return Parsed{}, fmt.Errorf("unknown platform prefix %q", prefix)
+	}
+
+	if strings.EqualFold(platformName, steamPlatformName) {
+		return parseSteamSwap(val)
+	}
+
+	return Parsed{
+		Kind:        KindSwapBasic,
+		PlatformKey: platformName,
+		UniqueID:    val,
+	}, nil
+}
+
+func resolvePlatformAlias(idx *PlatformIndex, token string) (string, bool) {
+	if idx == nil {
+		return "", false
+	}
+	t := strings.ToLower(strings.TrimSpace(token))
+	if t == "" {
+		return "", false
+	}
+	if canon, ok := idx.Names[t]; ok {
+		return canon, true
+	}
+	if canon, ok := idx.IdentifierAliases[t]; ok {
+		return canon, true
+	}
+	return "", false
+}
+
+func parseSteamSwap(val string) (Parsed, error) {
+	parts := strings.Split(val, ":")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	if len(parts) == 0 || parts[0] == "" {
+		return Parsed{}, fmt.Errorf("empty steam id in +s:")
+	}
+	id := parts[0]
+	state := -1
+	if len(parts) >= 2 && parts[1] != "" {
+		n, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return Parsed{}, fmt.Errorf("invalid persona state: %w", err)
+		}
+		state = n
+	}
+	return Parsed{
+		Kind:         KindSwapSteam,
+		PlatformKey:  steamPlatformName,
+		SteamID64:    id,
+		PersonaState: state,
+	}, nil
+}
+
+func parseLogLevelArg(a string) (slog.Level, bool, error) {
+	s := strings.TrimSpace(a)
+	low := strings.ToLower(s)
+	const long = "--log-level="
+	const short = "-log-level="
+	var rest string
+	switch {
+	case strings.HasPrefix(low, long):
+		rest = strings.TrimSpace(s[len(long):])
+	case strings.HasPrefix(low, short):
+		rest = strings.TrimSpace(s[len(short):])
+	default:
+		return 0, false, nil
+	}
+	if rest == "" {
+		return 0, false, fmt.Errorf("--log-level: value required (debug, info, warn, error)")
+	}
+	lvl, err := parseLogLevelValue(rest)
+	if err != nil {
+		return 0, false, err
+	}
+	return lvl, true, nil
+}
+
+func parseLogLevelValue(s string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "debug":
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("invalid --log-level %q (use debug, info, warn, error)", s)
+	}
+}
+
+// NeedsHeadlessMutex returns true when this process might run swap/logout without the GUI first.
+func (p Parsed) NeedsHeadlessMutex() bool {
+	switch p.Kind {
+	case KindSwapSteam, KindSwapBasic, KindLogout:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsListCommand reports argv that should print and exit before singleton / GUI.
+func (p Parsed) IsListCommand() bool {
+	switch p.Kind {
+	case KindListPlatforms, KindListAccounts:
+		return true
+	default:
+		return false
+	}
+}
+
+// RunsBeforeSingleton reports argv handled and exited before the singleton mutex
+// is taken. --clean-legacy-install belongs here because the running instance
+// spawns it elevated and waits: taking the mutex would deadlock the pair.
+func (p Parsed) RunsBeforeSingleton() bool {
+	return p.IsListCommand() || p.Kind == KindCleanLegacyInstall
+}
+
+// SubPageRoutes maps --open-page values that name a sub-page rather than a
+// platform. A restart-as-admin from one of those pages has to land back where
+// the user was, and "Steam" alone would drop them on the account list.
+var SubPageRoutes = map[string]string{
+	"steam/serverpicker": `{"page":"steam-server-picker"}`,
+	"settings":           `{"page":"settings"}`,
+}
+
+// RouteJSONForOpenPage returns a JSON string for the Wails "navigate" event payload.
+func (p Parsed) RouteJSONForOpenPage() string {
+	if p.Kind != KindOpenPage || strings.TrimSpace(p.OpenPage) == "" {
+		return ""
+	}
+	if route, ok := SubPageRoutes[strings.ToLower(strings.TrimSpace(p.OpenPage))]; ok {
+		return route
+	}
+	name := strings.ReplaceAll(p.OpenPage, `\`, `\\`)
+	name = strings.ReplaceAll(name, `"`, `\"`)
+	return fmt.Sprintf(`{"page":"platform","platformName":"%s"}`, name)
+}

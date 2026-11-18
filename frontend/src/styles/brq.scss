@@ -1,0 +1,288 @@
+/*
+    BRQ look: shapes, light and motion layered over every theme.
+    Colours come from theme variables (accent, panels), so other themes keep
+    their own palette and only borrow BRQ's shapes and animation.
+    All motion here is switched off by the app's "animations" setting and by
+    prefers-reduced-motion through animations.scss.
+*/
+
+@property --brq-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+
+/* Cut top-left and bottom-right corners, echoing the bevelled logo frame. */
+$tile-cut: 16px;
+@function brq-chamfer($c) {
+  @return polygon(#{$c} 0, 100% 0, 100% calc(100% - #{$c}), calc(100% - #{$c}) 100%, 0 100%, 0 #{$c});
+}
+
+:root {
+  --brq-glow: rgba(var(--accentInt), 0.45);
+  --brq-glow-soft: rgba(var(--accentInt), 0.18);
+  --brq-tile-fill: linear-gradient(160deg,
+      color-mix(in srgb, var(--code) 92%, white) 0%,
+      var(--code-background) 55%,
+      var(--darker-code-background) 100%);
+}
+
+/* ------------------------------------------------------------------ */
+/* Living background: slow drifting violet light, like the logo's silk */
+/* ------------------------------------------------------------------ */
+.page:not(.page--has-bg)::before {
+  content: "";
+  position: absolute;
+  inset: -25%;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(38% 32% at 22% 28%, rgba(var(--accentInt), 0.16), transparent 70%),
+    radial-gradient(34% 40% at 78% 72%, rgba(110, 50, 180, 0.22), transparent 70%),
+    radial-gradient(26% 26% at 62% 18%, rgba(var(--accentInt), 0.08), transparent 70%);
+  filter: blur(24px);
+  animation: brq-aurora 26s ease-in-out infinite alternate;
+}
+/* A faint grain keeps the gradients from banding and reads less "flat". */
+.page:not(.page--has-bg)::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: url("/img/noise.png");
+  opacity: 0.05;
+  mix-blend-mode: overlay;
+}
+
+@keyframes brq-aurora {
+  0% { transform: translate3d(0, 0, 0) rotate(0deg) scale(1); }
+  50% { transform: translate3d(4%, -3%, 0) rotate(6deg) scale(1.06); }
+  100% { transform: translate3d(-4%, 3%, 0) rotate(-5deg) scale(1.02); }
+}
+
+/* ------------------------------------------------------------------ */
+/* Home platform tiles                                                 */
+/* ------------------------------------------------------------------ */
+.platform_list_item:not(.platform_list_placeholder) {
+  border: none;
+  background: none;
+  isolation: isolate;
+  transition:
+    transform 260ms cubic-bezier(0.2, 0.9, 0.3, 1.25),
+    filter 260ms var(--ease-out);
+  animation: brq-tile-in 560ms cubic-bezier(0.2, 0.9, 0.25, 1.15) backwards;
+
+  /* Energy frame: a conic gradient that keeps circling the tile's edge. */
+  &::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    clip-path: brq-chamfer($tile-cut);
+    background: conic-gradient(from var(--brq-angle),
+        rgba(var(--accentInt), 0.22) 0deg,
+        rgba(var(--accentInt), 0.95) 40deg,
+        rgba(var(--accentInt), 0.22) 90deg,
+        rgba(var(--accentInt), 0.22) 180deg,
+        rgba(var(--accentInt), 0.95) 220deg,
+        rgba(var(--accentInt), 0.22) 270deg,
+        rgba(var(--accentInt), 0.22) 360deg);
+    opacity: 0.6;
+    transition: opacity 260ms var(--ease-out);
+    animation: brq-spin 7s linear infinite;
+  }
+
+  /* Glass body inside the frame. */
+  &::after {
+    content: "";
+    position: absolute;
+    inset: 1.5px;
+    z-index: -1;
+    clip-path: brq-chamfer($tile-cut - 0.6px);
+    background: var(--brq-tile-fill);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+
+  .platform_tile_ctx {
+    clip-path: brq-chamfer($tile-cut);
+  }
+
+  /* Light sweep, played on hover. */
+  .platform_tile_ctx::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: -60%;
+    width: 45%;
+    z-index: 11;
+    pointer-events: none;
+    background: linear-gradient(100deg, transparent, rgba(255, 255, 255, 0.16), transparent);
+    transform: skewX(-18deg) translateX(0);
+    opacity: 0;
+  }
+
+  .fgImg svg {
+    filter: drop-shadow(0 0 6px rgba(var(--accentInt), 0.35));
+    animation: brq-breathe 4.5s ease-in-out infinite;
+  }
+
+  .fgText p {
+    background: linear-gradient(180deg, #ffffff 0%, var(--accent-text-heading, var(--accent)) 85%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    text-shadow: none;
+    filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.55));
+    letter-spacing: 0.04em;
+  }
+
+  .icoBG {
+    opacity: 0.22;
+  }
+
+  &:hover {
+    box-shadow: none;
+    filter: drop-shadow(0 0 14px var(--brq-glow)) drop-shadow(0 10px 18px rgba(0, 0, 0, 0.45));
+
+    &:not(:active) {
+      /* Grow only: a lift would slide the tile out from under a cursor near
+         its bottom edge, and the press would miss. */
+      transform: scale(1.05);
+    }
+
+    &::before {
+      opacity: 1;
+    }
+
+    .platform_tile_ctx::after {
+      animation: brq-sweep 900ms cubic-bezier(0.3, 0.6, 0.2, 1) 1;
+    }
+
+    .fgImg {
+      animation: brq-float 2.2s ease-in-out infinite;
+    }
+
+    .fgImg svg {
+      filter: drop-shadow(0 0 12px rgba(var(--accentInt), 0.75));
+    }
+  }
+
+  &:active {
+    transform: scale(1.01);
+    filter: drop-shadow(0 0 22px var(--brq-glow));
+  }
+}
+
+/* Each tile lands a beat after the one before it. */
+@for $i from 1 through 24 {
+  .platform_list > :nth-child(#{$i}) {
+    animation-delay: #{($i - 1) * 45}ms;
+  }
+}
+
+.platform_list_item.platform_list_placeholder {
+  clip-path: brq-chamfer($tile-cut);
+  border-color: rgba(var(--accentInt), 0.6);
+  animation: brq-pulse 1.4s ease-in-out infinite;
+}
+
+.platform_list_item--ghost {
+  filter: drop-shadow(0 0 20px var(--brq-glow)) !important;
+}
+
+@keyframes brq-spin {
+  to { --brq-angle: 360deg; }
+}
+
+@keyframes brq-tile-in {
+  0% { opacity: 0; transform: translateY(18px) scale(0.86) rotateX(18deg); filter: blur(4px); }
+  60% { opacity: 1; filter: blur(0); }
+  100% { opacity: 1; transform: translateY(0) scale(1) rotateX(0); }
+}
+
+@keyframes brq-sweep {
+  0% { opacity: 0; transform: skewX(-18deg) translateX(0); }
+  15% { opacity: 1; }
+  100% { opacity: 0; transform: skewX(-18deg) translateX(420%); }
+}
+
+@keyframes brq-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+
+@keyframes brq-breathe {
+  0%, 100% { opacity: 0.9; }
+  50% { opacity: 1; }
+}
+
+@keyframes brq-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+/* ------------------------------------------------------------------ */
+/* Buttons                                                             */
+/* ------------------------------------------------------------------ */
+.button {
+  position: relative;
+  border-radius: 3px;
+  background: linear-gradient(180deg,
+      color-mix(in srgb, var(--button-bg) 85%, white) 0%,
+      var(--button-bg) 100%);
+  border-color: rgba(var(--accentInt), 0.28);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  transition:
+    filter var(--dur-fast) var(--ease-out),
+    box-shadow 200ms var(--ease-out),
+    border-color 200ms var(--ease-out),
+    background-color var(--dur-fast) var(--ease-out);
+
+  &:hover {
+    background: linear-gradient(180deg,
+        color-mix(in srgb, var(--button-bg-hover) 82%, white) 0%,
+        var(--button-bg-hover) 100%);
+    border-color: rgba(var(--accentInt), 0.7);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.1),
+      0 0 12px var(--brq-glow-soft),
+      0 0 0 1px rgba(var(--accentInt), 0.25);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Account cards                                                       */
+/* ------------------------------------------------------------------ */
+label.acc {
+  border-radius: 4px;
+
+  &:hover:not(.acc--broken) {
+    box-shadow:
+      0 8px 20px rgba(0, 0, 0, 0.45),
+      0 0 14px var(--brq-glow-soft),
+      0 0 0 1px rgba(var(--accentInt), 0.35);
+    transform: translateY(-3px);
+  }
+}
+
+.acc_list > * {
+  animation: brq-card-in 420ms cubic-bezier(0.2, 0.9, 0.25, 1.1) backwards;
+}
+@for $i from 1 through 30 {
+  .acc_list > :nth-child(#{$i}) {
+    animation-delay: #{($i - 1) * 30}ms;
+  }
+}
+@keyframes brq-card-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.95); }
+  to { opacity: 1; transform: none; }
+}
+
+/* ------------------------------------------------------------------ */
+/* Scrollbar                                                           */
+/* ------------------------------------------------------------------ */
+::-webkit-scrollbar-thumb {
+  background-image: linear-gradient(180deg, color-mix(in srgb, var(--accent) 70%, white), var(--accent));
+}
