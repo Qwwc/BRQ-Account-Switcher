@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="84" viewBox="0 0 400 84">
+  <defs>
+    <linearGradient id="fill" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#241536"/>
+      <stop offset="1" stop-color="#120a1d"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.14" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#6fb7ff" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#6fb7ff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#6fb7ff"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#6fb7ff"/>
+      
+    </linearGradient>
+    <linearGradient id="sweep" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fff" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#fff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="clip"><path d="M14 0H400V70L386 84H0V14Z"/></clipPath>
+  </defs>
+  <g clip-path="url(#clip)">
+    <rect width="400" height="84" fill="url(#fill)"/>
+    <rect width="400" height="84" fill="url(#halo)"/>
+    
+  </g>
+  <path d="M14 1H399V69.6L385.6 83H1V14.4Z" fill="none" stroke="url(#edge)" stroke-width="2"/>
+  <g transform="translate(52 42)">
+    <circle r="27" fill="#6fb7ff" fill-opacity="0.18" stroke="#6fb7ff" stroke-width="2"/>
+    <circle r="2.6" cy="-9" fill="#fff"/><path d="M0 -2 V11" stroke="#fff" stroke-width="4" stroke-linecap="round"/>
+  </g>
+  <text x="98" y="44" font-family="'Segoe UI Black','Segoe UI','Arial Black',Arial,sans-serif" font-size="26" font-weight="900" fill="#ffffff" letter-spacing="2">HOW IT WORKS</text>
+  <text x="99" y="66" font-family="'Segoe UI',Arial,sans-serif" font-size="14" fill="#cbbbe0" letter-spacing="0.5">What BRQ does with your logins</text>
+</svg>
